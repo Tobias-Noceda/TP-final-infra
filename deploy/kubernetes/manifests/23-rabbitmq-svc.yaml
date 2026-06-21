@@ -10,6 +10,7 @@ metadata:
     name: rabbitmq
   namespace: sock-shop
 spec:
+  clusterIP: None
   ports:
     # the port that this service should serve on
   - port: 5672

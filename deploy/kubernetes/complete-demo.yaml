@@ -4,6 +4,18 @@ kind: Namespace
 metadata:
   name: sock-shop
 ---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: pd-ssd-retain
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-ssd
+  replication-type: regional-pd
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain  # Importante: no borrar PV al eliminar PVC
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -73,13 +85,12 @@ spec:
     name: carts
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: carts-db
-  labels:
-    name: carts-db
   namespace: sock-shop
 spec:
+  serviceName: carts-db
   replicas: 1
   selector:
     matchLabels:
@@ -89,30 +100,70 @@ spec:
       labels:
         name: carts-db
     spec:
+      securityContext:
+        fsGroup: 999
+
       containers:
       - name: carts-db
-        image: mongo
+        image: mongo:3.4
+        imagePullPolicy: IfNotPresent
+
         ports:
-        - name: mongo
-          containerPort: 27017
-        securityContext:
-          capabilities:
-            drop:
-              - all
-            add:
-              - CHOWN
-              - SETGID
-              - SETUID
-          readOnlyRootFilesystem: true
+        - containerPort: 27017
+          name: mongo
+
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+
         volumeMounts:
-        - mountPath: /tmp
-          name: tmp-volume
-      volumes:
-        - name: tmp-volume
-          emptyDir:
-            medium: Memory
-      nodeSelector:
-        beta.kubernetes.io/os: linux
+        - name: carts-db-data
+          mountPath: /data/db
+
+        startupProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - mongo --quiet --eval "db.adminCommand('ping')"
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 30
+
+        readinessProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - mongo --quiet --eval "db.adminCommand('ping')"
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          timeoutSeconds: 15
+          failureThreshold: 6
+
+        livenessProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - mongo --quiet --eval "db.adminCommand('ping')"
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          timeoutSeconds: 15
+          failureThreshold: 5
+  volumeClaimTemplates:
+  - metadata:
+      name: carts-db-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: "standard-rwo"  # o "pd.csi.storage.gke.io"
+      resources:
+        requests:
+          storage: 2Gi
 ---
 apiVersion: v1
 kind: Service
@@ -122,6 +173,7 @@ metadata:
     name: carts-db
   namespace: sock-shop
 spec:
+  clusterIP: None
   ports:
     # the port that this service should serve on
   - port: 27017
@@ -203,17 +255,27 @@ spec:
     name: catalogue
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: catalogue-db
   labels:
     name: catalogue-db
   namespace: sock-shop
 spec:
+  serviceName: "catalogue-db"
   replicas: 1
   selector:
     matchLabels:
       name: catalogue-db
+  volumeClaimTemplates:
+  - metadata:
+      name: catalogue-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: "standard-rwo"  # o "pd.csi.storage.gke.io"
+      resources:
+        requests:
+          storage: 5Gi
   template:
     metadata:
       labels:
@@ -230,8 +292,74 @@ spec:
         ports:
         - name: mysql
           containerPort: 3306
+        resources:
+          limits:
+            cpu: 500m
+            memory: 1Gi
+          requests:
+            cpu: 250m
+            memory: 512Mi
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mysqladmin ping -h 127.0.0.1 -u root -p$MYSQL_ROOT_PASSWORD > /dev/null 2>&1
+          timeoutSeconds: 10
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mysqladmin ping -h 127.0.0.1 -u root -p$MYSQL_ROOT_PASSWORD > /dev/null 2>&1
+          timeoutSeconds: 10
+          initialDelaySeconds: 45
+          periodSeconds: 5
+          failureThreshold: 3
+        securityContext:
+          capabilities:
+            drop:
+              - all
+            add:
+              - CHOWN
+              - SETGID
+              - SETUID
+              - DAC_OVERRIDE
+          readOnlyRootFilesystem: false
+        volumeMounts:
+        - name: catalogue-data
+          mountPath: /var/lib/mysql
+        - name: tmp-volume
+          mountPath: /tmp
+      initContainers:
+      - name: init-catalogue-db
+        image: busybox:1.35
+        # Added 'rm -rf /var/lib/mysql/lost+found' to clear cloud-provider artifacts
+        command: ['sh', '-c', 'chmod 777 /var/lib/mysql && rm -rf /var/lib/mysql/lost+found || true']
+        volumeMounts:
+        - name: catalogue-data
+          mountPath: /var/lib/mysql
+      volumes:
+        - name: tmp-volume
+          emptyDir: 
+            medium: Memory
       nodeSelector:
         beta.kubernetes.io/os: linux
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: name
+                  operator: In
+                  values:
+                  - catalogue-db
+              topologyKey: "kubernetes.io/hostname"
 ---
 apiVersion: v1
 kind: Service
@@ -241,6 +369,7 @@ metadata:
     name: catalogue-db
   namespace: sock-shop
 spec:
+  clusterIP: None
   ports:
     # the port that this service should serve on
   - port: 3306
@@ -310,13 +439,32 @@ metadata:
     name: front-end
   namespace: sock-shop
 spec:
-  type: NodePort
+  type: ClusterIP
   ports:
   - port: 80
     targetPort: 8079
-    nodePort: 30001
+    name: http
   selector:
     name: front-end
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sock-shop
+  namespace: sock-shop
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: front-end
+            port:
+              number: 80
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -339,15 +487,15 @@ spec:
       - name: orders
         image: weaveworksdemos/orders:0.4.7
         env:
-         - name: JAVA_OPTS
-           value: -Xms64m -Xmx128m -XX:+UseG1GC -Djava.security.egd=file:/dev/urandom -Dspring.zipkin.enabled=false
+        - name: JAVA_OPTS
+          value: -Xms64m -Xmx256m -XX:+UseG1GC -Djava.security.egd=file:/dev/urandom -Dspring.zipkin.enabled=false
         resources:
-          limits:
-            cpu: 500m
-            memory: 500Mi
           requests:
-            cpu: 100m
-            memory: 300Mi
+            cpu: 200m      # Increase from 100m
+            memory: 300Mi   # Increase from 200Mi
+          limits:
+            cpu: 500m       # Increase from 300m
+            memory: 1Gi     # Increase from 500Mi
         ports:
         - containerPort: 80
         securityContext:
@@ -387,46 +535,87 @@ spec:
     name: orders
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: orders-db
-  labels:
-    name: orders-db
   namespace: sock-shop
 spec:
+  serviceName: orders-db
   replicas: 1
+
   selector:
     matchLabels:
       name: orders-db
+
   template:
     metadata:
       labels:
         name: orders-db
     spec:
+      securityContext:
+        fsGroup: 999
+
       containers:
       - name: orders-db
-        image: mongo
+        image: mongo:3.4
+        imagePullPolicy: IfNotPresent
+
         ports:
-        - name: mongo
-          containerPort: 27017
-        securityContext:
-          capabilities:
-            drop:
-              - all
-            add:
-              - CHOWN
-              - SETGID
-              - SETUID
-          readOnlyRootFilesystem: true
+        - containerPort: 27017
+          name: mongo
+
+        resources:
+          requests:
+            cpu: 200m       # Increase
+            memory: 512Mi   # Increase
+          limits:
+            cpu: 1000m      # Increase
+            memory: 2Gi     # Increase
+
         volumeMounts:
-        - mountPath: /tmp
-          name: tmp-volume
-      volumes:
-        - name: tmp-volume
-          emptyDir:
-            medium: Memory
-      nodeSelector:
-        beta.kubernetes.io/os: linux
+        - name: orders-db-data
+          mountPath: /data/db
+
+        startupProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mongo --quiet --eval "db.adminCommand('ping')"
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 30
+
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mongo --quiet --eval "db.adminCommand('ping')"
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          timeoutSeconds: 15
+          failureThreshold: 6
+
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mongo --quiet --eval "db.adminCommand('ping')"
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          timeoutSeconds: 15
+          failureThreshold: 5
+  volumeClaimTemplates:
+  - metadata:
+      name: orders-db-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: "standard-rwo"  # o "pd.csi.storage.gke.io"
+      resources:
+        requests:
+          storage: 2Gi
 ---
 apiVersion: v1
 kind: Service
@@ -436,6 +625,7 @@ metadata:
     name: orders-db
   namespace: sock-shop
 spec:
+  clusterIP: None
   ports:
     # the port that this service should serve on
   - port: 27017
@@ -565,6 +755,19 @@ spec:
   selector:
     name: queue-master
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rabbitmq-pvc
+  namespace: sock-shop
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: "standard-rwo"  # o "pd.csi.storage.gke.io"
+  resources:
+    requests:
+      storage: 2Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -592,6 +795,18 @@ spec:
           name: management
         - containerPort: 5672
           name: rabbitmq
+        env:
+        - name: RABBITMQ_DEFAULT_USER
+          value: guest
+        - name: RABBITMQ_DEFAULT_PASS
+          value: guest
+        resources:
+          limits:
+            cpu: 300m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
         securityContext:
           capabilities:
             drop:
@@ -601,12 +816,46 @@ spec:
               - SETGID
               - SETUID
               - DAC_OVERRIDE
-          readOnlyRootFilesystem: true
+          readOnlyRootFilesystem: false
+        volumeMounts:
+        - name: rabbitmq-data
+          mountPath: /var/lib/rabbitmq
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - rabbitmqctl status > /dev/null 2>&1
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          failureThreshold: 3
+          timeoutSeconds: 60
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - rabbitmqctl status > /dev/null 2>&1
+          initialDelaySeconds: 90
+          periodSeconds: 30
+          failureThreshold: 3
+          timeoutSeconds: 60
       - name: rabbitmq-exporter
         image: kbudde/rabbitmq-exporter
         ports:
         - containerPort: 9090
           name: exporter
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+      volumes:
+        - name: rabbitmq-data
+          persistentVolumeClaim:
+            claimName: rabbitmq-pvc
       nodeSelector:
         beta.kubernetes.io/os: linux
 ---
@@ -621,6 +870,7 @@ metadata:
     name: rabbitmq
   namespace: sock-shop
 spec:
+  clusterIP: None
   ports:
     # the port that this service should serve on
   - port: 5672
@@ -632,6 +882,36 @@ spec:
     protocol: TCP
   selector:
     name: rabbitmq
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: session-db-pvc
+  namespace: sock-shop
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: "standard-rwo"  # o "pd.csi.storage.gke.io"
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: sock-shop
+data:
+  redis.conf: |
+    # Enable RDS snapshots (Snapshooting)
+    save 900 1
+    save 300 10
+    save 60 10000
+    # Enable AOF (Append Only File)
+    appendonly yes
+    appendfsync everysec
+    # Path for persistence
+    dir /data
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -655,9 +935,19 @@ spec:
       containers:
       - name: session-db
         image: redis:alpine
+        command:
+          - "redis-server"
+          - "/usr/local/etc/redis/redis.conf"
         ports:
         - name: redis
           containerPort: 6379
+        resources:
+          limits:
+            cpu: 200m
+            memory: 512Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
         securityContext:
           capabilities:
             drop:
@@ -666,7 +956,39 @@ spec:
               - CHOWN
               - SETGID
               - SETUID
-          readOnlyRootFilesystem: true
+          readOnlyRootFilesystem: false
+        volumeMounts:
+        - name: session-db-data
+          mountPath: /data
+        - name: redis-config
+          mountPath: /usr/local/etc/redis
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - redis-cli ping > /dev/null 2>&1
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 3
+          timeoutSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - redis-cli ping > /dev/null 2>&1
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          failureThreshold: 3
+          timeoutSeconds: 10
+      volumes:
+      - name: session-db-data
+        persistentVolumeClaim:
+          claimName: session-db-pvc
+      - name: redis-config
+        configMap:
+          name: redis-config
       nodeSelector:
         beta.kubernetes.io/os: linux
 ---
@@ -678,6 +1000,7 @@ metadata:
     name: session-db
   namespace: sock-shop
 spec:
+  clusterIP: None
   ports:
     # the port that this service should serve on
   - port: 6379
@@ -711,12 +1034,12 @@ spec:
          - name: JAVA_OPTS
            value: -Xms64m -Xmx128m -XX:+UseG1GC -Djava.security.egd=file:/dev/urandom -Dspring.zipkin.enabled=false
         resources:
-          limits:
-            cpu: 300m
-            memory: 500Mi
           requests:
-            cpu: 100m
+            cpu: 200m
             memory: 300Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
         ports:
         - containerPort: 80
         securityContext:
@@ -828,20 +1151,29 @@ spec:
     targetPort: 80
   selector:
     name: user
-
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: user-db
   labels:
     name: user-db
   namespace: sock-shop
 spec:
+  serviceName: "user-db"
   replicas: 1
   selector:
     matchLabels:
       name: user-db
+  volumeClaimTemplates:
+  - metadata:
+      name: user-db-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: "standard-rwo"  # o "pd.csi.storage.gke.io"
+      resources:
+        requests:
+          storage: 2Gi
   template:
     metadata:
       labels:
@@ -850,10 +1182,36 @@ spec:
       containers:
       - name: user-db
         image: weaveworksdemos/user-db:0.3.0
-
         ports:
         - name: mongo
           containerPort: 27017
+        resources:
+          limits:
+            cpu: 250m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mongo --eval "db.adminCommand('ping')" > /dev/null 2>&1
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 3
+          timeoutSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mongo --eval "db.adminCommand('ping')" > /dev/null 2>&1
+          initialDelaySeconds: 45
+          periodSeconds: 5
+          failureThreshold: 3
+          timeoutSeconds: 10
         securityContext:
           capabilities:
             drop:
@@ -862,8 +1220,10 @@ spec:
               - CHOWN
               - SETGID
               - SETUID
-          readOnlyRootFilesystem: true
+          readOnlyRootFilesystem: false
         volumeMounts:
+        - name: user-db-data
+          mountPath: /data/db
         - mountPath: /tmp
           name: tmp-volume
       volumes:
@@ -881,10 +1241,10 @@ metadata:
     name: user-db
   namespace: sock-shop
 spec:
+  clusterIP: None
   ports:
     # the port that this service should serve on
   - port: 27017
     targetPort: 27017
   selector:
     name: user-db
-

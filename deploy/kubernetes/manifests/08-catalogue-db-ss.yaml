@@ -1,0 +1,107 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: catalogue-db
+  labels:
+    name: catalogue-db
+  namespace: sock-shop
+spec:
+  serviceName: "catalogue-db"
+  replicas: 1
+  selector:
+    matchLabels:
+      name: catalogue-db
+  volumeClaimTemplates:
+  - metadata:
+      name: catalogue-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: "standard-rwo"  # o "pd.csi.storage.gke.io"
+      resources:
+        requests:
+          storage: 20Gi
+  template:
+    metadata:
+      labels:
+        name: catalogue-db
+    spec:
+      containers:
+      - name: catalogue-db
+        image: weaveworksdemos/catalogue-db:0.3.0
+        env:
+          - name: MYSQL_ROOT_PASSWORD
+            value: fake_password
+          - name: MYSQL_DATABASE
+            value: socksdb
+        ports:
+        - name: mysql
+          containerPort: 3306
+        resources:
+          limits:
+            cpu: 500m
+            memory: 1Gi
+          requests:
+            cpu: 250m
+            memory: 512Mi
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mysqladmin ping -h 127.0.0.1 -u root -p$MYSQL_ROOT_PASSWORD > /dev/null 2>&1
+          timeoutSeconds: 10
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - mysqladmin ping -h 127.0.0.1 -u root -p$MYSQL_ROOT_PASSWORD > /dev/null 2>&1
+          timeoutSeconds: 10
+          initialDelaySeconds: 45
+          periodSeconds: 5
+          failureThreshold: 3
+        securityContext:
+          capabilities:
+            drop:
+              - all
+            add:
+              - CHOWN
+              - SETGID
+              - SETUID
+              - DAC_OVERRIDE
+          readOnlyRootFilesystem: false
+        volumeMounts:
+        - name: catalogue-data
+          mountPath: /var/lib/mysql
+        - name: tmp-volume
+          mountPath: /tmp
+      initContainers:
+      - name: init-catalogue-db
+        image: busybox:1.35
+        # Added 'rm -rf /var/lib/mysql/lost+found' to clear cloud-provider artifacts
+        command: ['sh', '-c', 'chmod 777 /var/lib/mysql && rm -rf /var/lib/mysql/lost+found || true']
+        volumeMounts:
+        - name: catalogue-data
+          mountPath: /var/lib/mysql
+      volumes:
+        - name: tmp-volume
+          emptyDir: 
+            medium: Memory
+      nodeSelector:
+        beta.kubernetes.io/os: linux
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: name
+                  operator: In
+                  values:
+                  - catalogue-db
+              topologyKey: "kubernetes.io/hostname"

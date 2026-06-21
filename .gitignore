@@ -125,9 +125,15 @@ coverage/
 packer_cache
 docker-swarm.box
 *.tfvars
+*.tfstate*
+*.lock.hcl
+.terraform
 join.sh
 output-virtualbox-iso
 
 # Ignore grafanalib output
 /graphs/__pycache__/
 /graphs/*.json
+
+# agents files
+CLAUDE.md

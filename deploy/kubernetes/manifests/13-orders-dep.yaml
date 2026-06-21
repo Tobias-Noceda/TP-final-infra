@@ -20,15 +20,15 @@ spec:
       - name: orders
         image: weaveworksdemos/orders:0.4.7
         env:
-         - name: JAVA_OPTS
-           value: -Xms64m -Xmx128m -XX:+UseG1GC -Djava.security.egd=file:/dev/urandom -Dspring.zipkin.enabled=false
+        - name: JAVA_OPTS
+          value: -Xms64m -Xmx256m -XX:+UseG1GC -Djava.security.egd=file:/dev/urandom -Dspring.zipkin.enabled=false
         resources:
-          limits:
-            cpu: 500m
-            memory: 500Mi
           requests:
-            cpu: 100m
-            memory: 300Mi
+            cpu: 200m      # Increase from 100m
+            memory: 300Mi   # Increase from 200Mi
+          limits:
+            cpu: 500m       # Increase from 300m
+            memory: 1Gi     # Increase from 500Mi
         ports:
         - containerPort: 80
         securityContext:

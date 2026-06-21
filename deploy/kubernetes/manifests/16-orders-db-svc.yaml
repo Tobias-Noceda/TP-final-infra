@@ -2,14 +2,15 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: catalogue-db
+  name: orders-db
   labels:
-    name: catalogue-db
+    name: orders-db
   namespace: sock-shop
 spec:
+  clusterIP: None
   ports:
     # the port that this service should serve on
-  - port: 3306
-    targetPort: 3306
+  - port: 27017
+    targetPort: 27017
   selector:
-    name: catalogue-db
+    name: orders-db
